@@ -1,3 +1,5 @@
+#![feature(drop_types_in_const)]
+
 extern crate either;
 extern crate futures;
 extern crate futures_cpupool;
@@ -5,6 +7,7 @@ extern crate futures_cpupool;
 extern crate log;
 extern crate env_logger;
 extern crate num_cpus;
+extern crate typed_arena;
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -23,6 +26,7 @@ use futures::{future, stream, Future, Sink, Stream};
 use futures::sink::Wait;
 use futures::sync::mpsc::{self, Sender};
 use futures_cpupool::CpuPool;
+use typed_arena::Arena;
 
 #[derive(Debug)]
 struct SegPath {
@@ -30,7 +34,7 @@ struct SegPath {
     segment: OsString,
 }
 
-type Parent = Either<Arc<SegPath>, Arc<PathBuf>>;
+type Parent = Either<&'static SegPath, Arc<PathBuf>>;
 
 impl SegPath {
     fn to_path(&self) -> PathBuf {
@@ -43,17 +47,19 @@ impl SegPath {
     }
 }
 
-type SegmentSender = Wait<Sender<(SegPath, u64)>>;
+type SegmentSender = Wait<Sender<(&'static SegPath, u64)>>;
+
+static mut ARENA: Option<Arena<SegPath>> = None;
 
 fn do_sub(entry: IoResult<DirEntry>, target: &mut SegmentSender, parent: Parent) -> IoResult<()> {
     let entry = entry?;
     let meta = entry.metadata()?;
     let ftype = meta.file_type();
-    let segment = SegPath { parent, segment: entry.file_name() };
+    let segment: &SegPath = unsafe { ARENA.as_ref().unwrap() }.alloc(SegPath { parent, segment: entry.file_name() });
     if ftype.is_file() {
         target.send((segment, meta.len())).unwrap();
     } else if ftype.is_dir() {
-        recurse_dir(entry.path(), target, Either::Left(Arc::new(segment)));
+        recurse_dir(entry.path(), target, Either::Left(segment));
     }
     Ok(())
 }
@@ -103,9 +109,10 @@ impl Details {
 
 fn main() {
     env_logger::init().unwrap();
+    unsafe { ARENA = Some(Arena::new()) };
     let cpus = num_cpus::get() * 2;
     let p = PathBuf::from(env::args().nth(1).unwrap());
-    let (sender, receiver) = mpsc::channel::<(SegPath, u64)>(102400);
+    let (sender, receiver) = mpsc::channel::<(&SegPath, u64)>(102400);
     let details_thread = thread::spawn(move || {
         let pool = CpuPool::new(cpus);
         receiver
