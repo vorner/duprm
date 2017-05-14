@@ -103,7 +103,7 @@ impl Details {
 
 fn main() {
     env_logger::init().unwrap();
-    let cpus = num_cpus::get() + 3;
+    let cpus = num_cpus::get() * 2;
     let p = PathBuf::from(env::args().nth(1).unwrap());
     let (sender, receiver) = mpsc::channel::<(SegPath, u64)>(1024);
     let details_thread = thread::spawn(move || {
