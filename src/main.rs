@@ -110,6 +110,20 @@ fn main() {
         let pool = CpuPool::new(cpus);
         receiver
             .filter(|&(_, len)| len > 0)
+            .fold(Box::new(HashMap::new()), |mut hash, (segments, details)| {
+                debug!("Name-hashing segment {}", segments.to_path().to_string_lossy());
+                hash.entry(segments.segment.to_owned())
+                    .or_insert_with(Vec::new)
+                    .push((segments, details));
+                Ok(hash)
+            })
+            .and_then(|hash| {
+                let iter = hash.into_iter()
+                    .flat_map(|(_, infos)| infos.into_iter())
+                    .map(Ok);
+                Ok(stream::iter(iter))
+            })
+            .flatten_stream()
             .map(|(path_segments, len)| {
                 pool.spawn(
                     future::lazy(move || {
@@ -127,7 +141,9 @@ fn main() {
                 },
             })
             .fold(Box::new(HashMap::new()), |mut hash, (segments, details)| {
-                hash.entry(details).or_insert_with(Vec::new).push(segments);
+                hash.entry(details)
+                    .or_insert_with(Vec::new)
+                    .push(segments);
                 Ok(hash)
             })
             .and_then(|hash| {
