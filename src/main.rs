@@ -12,34 +12,30 @@ extern crate serde;
 #[macro_use]
 extern crate serde_derive;
 extern crate symtern;
-extern crate typed_arena;
 
 use std::collections::{BTreeMap, HashMap};
 use std::collections::hash_map::DefaultHasher;
 use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs::{self, DirEntry, File};
 use std::hash::Hasher;
-use std::io::{Error as IoError, Read, Result as IoResult};
+use std::io::{Error as IoError, Read, Result as IoResult, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::slice::Iter;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread;
 
 use bincode::Infinite;
-use either::Either;
-use futures::{future, stream, Future, Sink, Stream};
-use futures::sink::Wait;
-use futures::sync::mpsc::{self, Sender};
+use futures::{future, stream, Future, Stream};
 use futures_cpupool::CpuPool;
 use symtern::{Pool, Sym};
 use symtern::prelude::*;
-use typed_arena::Arena;
+
+const DONE_FILE: &str = "done-size.txt";
+const TREE_FILE: &str = "files.dump";
 
 type Index = u64;
-type Intern = Pool<OsStr, Index>;
+type Intern = Pool<Path, Index>;
 type Symbol = Sym<Index>;
 
 struct TreeNode {
@@ -54,7 +50,7 @@ struct FileInfo {
 }
 
 struct FileTree {
-    segments: Pool<Path, Index>,
+    segments: Intern,
     nodes: Vec<TreeNode>,
     files: Vec<FileInfo>,
 }
@@ -76,7 +72,7 @@ impl FileTree {
     pub fn build<P: AsRef<Path>>(path: P) -> Self {
         info!("Scanning path {}", path.as_ref().to_string_lossy());
         let mut tree = FileTree {
-            segments: Pool::new(),
+            segments: Intern::new(),
             nodes: Vec::new(),
             files: Vec::new(),
         };
@@ -138,6 +134,7 @@ impl FileTree {
         self.node_path(file.node)
     }
     pub fn store<P: AsRef<Path>>(&self, file: P) -> IoResult<()> {
+        info!("Storing tree into {}", file.as_ref().to_string_lossy());
         let mut segments: HashMap<Index, &Path> = HashMap::new();
         let mut mapping: HashMap<Symbol, Index> = HashMap::new();
         let mut cnt: Index = 0;
@@ -210,6 +207,7 @@ fn main() {
     env_logger::init().unwrap();
     let p = PathBuf::from(env::args().nth(1).expect("Expected a path"));
     let tree = FileTree::build(p);
+    tree.store(TREE_FILE).unwrap();
     let total = tree.len();
     info!("Going to examine {} files", total);
     let done = AtomicUsize::new(0);
@@ -223,91 +221,60 @@ fn main() {
             .push(node);
     }
     // Work on the sizes, starting with the biggest
-    let prehashed = size_prehash
-        .into_iter()
-        .rev()
-        .map(Ok::<_, IoError>);
-    stream::iter(prehashed)
-        .map(|(size, nodes)| {
-            info!("Working on size {}, {} of {} files done", size, done.load(Ordering::Relaxed), total);
-            // Group the ones with the same basename.suffix together. There's a chance these
-            // actually correspond to the same extents, so use the OS page cache by reading them
-            // together.
-            let mut name_prehash = HashMap::new();
-            for node in &nodes {
-                name_prehash
-                    .entry(node.node)
-                    .or_insert_with(Vec::new)
-                    .push(node);
-            }
-            let grouped = name_prehash
-                .into_iter()
-                .flat_map(|(_basename, nodes)| nodes.into_iter())
-                .map(Ok::<_, IoError>);
-            stream::iter(grouped)
-                .map(|node| {
-                    let path = tree.path(node);
-                    let node = (*node).clone();
-                    debug!("Coputing details of {}", path.to_string_lossy());
-                    pool.spawn(future::lazy(move || {
-                        let details = Details::compute(path, node.size);
-                        Ok((node, details)) as IoResult<_>
-                    }))
-                })
-                .buffer_unordered(cpus);
-        });
-    /*
-    unsafe { ARENA = Some(Arena::new()) };
-    let (sender, receiver) = mpsc::channel::<(&SegPath, u64)>(102400);
-    let details_thread = thread::spawn(move || {
-        let pool = CpuPool::new(cpus);
-        receiver
-            .filter(|&(_, len)| len > 0)
-            .fold(Box::new(HashMap::new()), |mut hash, (segments, details)| {
-                debug!("Name-hashing segment {}", segments.to_path().to_string_lossy());
-                hash.entry(segments.segment.to_owned())
-                    .or_insert_with(Vec::new)
-                    .push((segments, details));
-                Ok(hash)
-            })
-            .and_then(|hash| {
-                let iter = hash.into_iter()
-                    .flat_map(|(_, infos)| infos.into_iter())
-                    .map(Ok);
-                Ok(stream::iter(iter))
-            })
-            .flatten_stream()
-            .map(|(path_segments, len)| {
-                pool.spawn(
-                    future::lazy(move || {
-                        let details = Details::compute(path_segments.to_path(), len);
-                        Ok((path_segments, details))
-                    })
-                )
+    for (size, nodes) in size_prehash.into_iter().rev() {
+        info!("Working on size {}, {} of {} files done", size, done.load(Ordering::Relaxed), total);
+        // Group the ones with the same basename.suffix together. There's a chance these
+        // actually correspond to the same extents, so use the OS page cache by reading them
+        // together.
+        let mut name_prehash = HashMap::new();
+        for node in &nodes {
+            name_prehash
+                .entry(node.node)
+                .or_insert_with(Vec::new)
+                .push(node);
+        }
+        let grouped = name_prehash
+            .into_iter()
+            .flat_map(|(_basename, nodes)| nodes.into_iter())
+            .map(Ok::<_, IoError>);
+        stream::iter(grouped)
+            .map(|node| {
+                let path = tree.path(node);
+                let node = (*node).clone();
+                let done = done.fetch_add(1, Ordering::Relaxed);
+                debug!("[{}/{}] Coputing details of {} of size {}", done, total, path.to_string_lossy(), size);
+                pool.spawn(future::lazy(move || {
+                    let details = Details::compute(path, node.size);
+                    Ok((node, details)) as IoResult<_>
+                }))
             })
             .buffer_unordered(cpus)
-            .filter_map(|(segments, details)| match details {
-                Ok(details) => Some((segments, details)),
+            .filter_map(|(node, details)| match details {
+                Ok(details) => Some((node, details)),
                 Err(e) => {
                     error!("Error getting file info: {}", e);
                     None
                 },
             })
-            .fold(Box::new(HashMap::new()), |mut hash, (segments, details)| {
+            .fold(Box::new(HashMap::new()), |mut hash, (node, details)| {
                 hash.entry(details)
                     .or_insert_with(Vec::new)
-                    .push(segments);
-                Ok(hash)
+                    .push(node);
+                Ok(hash) as IoResult<_>
             })
             .and_then(|hash| {
                  stream::iter(hash.into_iter().map(|val| Ok(val)))
-                    .filter(|&(_, ref segments)| segments.len() > 1)
-                    .map(|(details, segments)| {
+                    .filter(|&(_, ref nodes)| nodes.len() > 1)
+                    .map(|(details, nodes): (Details, Vec<_>)| {
+                        let paths = nodes
+                            .iter()
+                            .map(|node| tree.path(&node))
+                            .collect::<Vec<_>>();
                         let run = move || {
                             let mut command = Command::new("btrfs-extent-same");
                             command.arg(format!("{}", details.len));
-                            for seg in &segments {
-                                command.arg(seg.to_path()).arg("0");
+                            for path in &paths {
+                                command.arg(path).arg("0");
                             }
                             debug!("cmd: {:?}", command);
                             match command.status() {
@@ -325,8 +292,9 @@ fn main() {
             })
             .wait()
             .unwrap();
-    });
-    recurse_dir(&p, &mut sender.wait(), Either::Right(Arc::new(p.clone())));
-    details_thread.join().unwrap();
-    */
+        let mut s = File::create(DONE_FILE).unwrap();
+        write!(s, "{}", size).unwrap();
+    }
+    fs::remove_file(TREE_FILE).unwrap();
+    fs::remove_file(DONE_FILE).unwrap();
 }
