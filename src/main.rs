@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::fs::{self, DirEntry, File};
 use std::hash::Hasher;
 use std::io::{Error as IoError, Read, Result as IoResult, Write};
@@ -63,7 +64,9 @@ struct StorableTreeNode {
 
 #[derive(Serialize)]
 struct StorableTree<'a> {
-    segments: HashMap<Index, &'a Path>,
+    // Store the path segments as byte slices, so serde doesn't complain about invalid utf8s (we
+    // have them).
+    segments: HashMap<Index, &'a [u8]>,
     nodes: Vec<StorableTreeNode>,
     files: &'a Vec<FileInfo>,
 }
@@ -135,7 +138,7 @@ impl FileTree {
     }
     pub fn store<P: AsRef<Path>>(&self, file: P) -> IoResult<()> {
         info!("Storing tree into {}", file.as_ref().to_string_lossy());
-        let mut segments: HashMap<Index, &Path> = HashMap::new();
+        let mut segments: HashMap<Index, &[u8]> = HashMap::new();
         let mut mapping: HashMap<Symbol, Index> = HashMap::new();
         let mut cnt: Index = 0;
         let nodes = (&self.nodes)
@@ -143,7 +146,12 @@ impl FileTree {
             .map(|&TreeNode { segment, parent }| {
                 let idx = mapping.entry(segment).or_insert_with(|| {
                     cnt += 1;
-                    segments.insert(cnt, self.segments.resolve(segment).unwrap());
+                    let segments_bytes = self.segments
+                        .resolve(segment)
+                        .unwrap()
+                        .as_os_str()
+                        .as_bytes();
+                    segments.insert(cnt, segments_bytes);
                     cnt
                 });
                 StorableTreeNode {
