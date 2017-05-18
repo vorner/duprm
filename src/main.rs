@@ -16,6 +16,7 @@ extern crate symtern;
 use std::collections::{BTreeMap, HashMap};
 use std::collections::hash_map::DefaultHasher;
 use std::env;
+use std::error::Error;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::fs::{self, DirEntry, File};
@@ -25,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::slice::Iter;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::u64;
 
 use bincode::Infinite;
 use futures::{future, stream, Future, Stream};
@@ -211,8 +213,17 @@ impl Details {
     }
 }
 
+fn get_limit() -> Result<u64, Box<Error>> {
+    let mut f = File::open(DONE_FILE)?;
+    let mut input = Vec::new();
+    f.read_to_end(&mut input)?;
+    let num = String::from_utf8(input)?.parse()?;
+    Ok(num)
+}
+
 fn main() {
     env_logger::init().unwrap();
+    let limit = get_limit().unwrap_or(u64::MAX);
     let p = PathBuf::from(env::args().nth(1).expect("Expected a path"));
     let tree = FileTree::build(p);
     tree.store(TREE_FILE).unwrap();
@@ -229,80 +240,97 @@ fn main() {
             .push(node);
     }
     // Work on the sizes, starting with the biggest
-    for (size, nodes) in size_prehash.into_iter().rev() {
-        info!("Working on size {}, {} of {} files done", size, done.load(Ordering::Relaxed), total);
-        // Group the ones with the same basename.suffix together. There's a chance these
-        // actually correspond to the same extents, so use the OS page cache by reading them
-        // together.
-        let mut name_prehash = HashMap::new();
-        for node in &nodes {
-            name_prehash
-                .entry(node.node)
-                .or_insert_with(Vec::new)
-                .push(node);
-        }
-        let grouped = name_prehash
-            .into_iter()
-            .flat_map(|(_basename, nodes)| nodes.into_iter())
-            .map(Ok::<_, IoError>);
-        stream::iter(grouped)
-            .map(|node| {
-                let path = tree.path(node);
-                let node = (*node).clone();
-                let done = done.fetch_add(1, Ordering::Relaxed);
-                debug!("[{}/{}] Coputing details of {} of size {}", done, total, path.to_string_lossy(), size);
-                pool.spawn(future::lazy(move || {
-                    let details = Details::compute(path, node.size);
-                    Ok((node, details)) as IoResult<_>
-                }))
-            })
-            .buffer_unordered(cpus)
-            .filter_map(|(node, details)| match details {
-                Ok(details) => Some((node, details)),
-                Err(e) => {
-                    error!("Error getting file info: {}", e);
-                    None
-                },
-            })
-            .fold(Box::new(HashMap::new()), |mut hash, (node, details)| {
-                hash.entry(details)
+    let iter = size_prehash
+        .into_iter()
+        .rev()
+        .map(Ok::<_, IoError>);
+    stream::iter(iter)
+        .map(|(size, mut nodes)| {
+            if size > limit {
+                done.fetch_add(nodes.len(), Ordering::Relaxed);
+                // A cheat, to skip the ones that are already done
+                nodes.clear();
+            } else {
+                info!("Working on size {}, {} of {} files done", size, done.load(Ordering::Relaxed), total);
+                let mut s = File::create(DONE_FILE).unwrap();
+                write!(s, "{}", size).unwrap();
+            }
+            // Group the ones with the same basename.suffix together. There's a chance these
+            // actually correspond to the same extents, so use the OS page cache by reading them
+            // together.
+            let mut name_prehash = HashMap::new();
+            for node in nodes.into_iter() {
+                name_prehash
+                    .entry(node.node)
                     .or_insert_with(Vec::new)
                     .push(node);
-                Ok(hash) as IoResult<_>
-            })
-            .and_then(|hash| {
-                 stream::iter(hash.into_iter().map(|val| Ok(val)))
-                    .filter(|&(_, ref nodes)| nodes.len() > 1)
-                    .map(|(details, nodes): (Details, Vec<_>)| {
-                        let paths = nodes
-                            .iter()
-                            .map(|node| tree.path(&node))
-                            .collect::<Vec<_>>();
-                        let run = move || {
-                            let mut command = Command::new("btrfs-extent-same");
-                            command.arg(format!("{}", details.len));
-                            for path in &paths {
-                                command.arg(path).arg("0");
-                            }
-                            debug!("cmd: {:?}", command);
-                            match command.status() {
-                                Ok(status) => if !status.success() {
-                                    error!("Failed to run: {}", status);
-                                },
-                                Err(e) => error!("Failed to run: {}", e),
-                            }
-                            Ok(())
-                        };
-                        pool.spawn(future::lazy(run))
-                    })
-                    .buffer_unordered(cpus)
-                    .for_each(|()| Ok(()))
-            })
-            .wait()
-            .unwrap();
-        let mut s = File::create(DONE_FILE).unwrap();
-        write!(s, "{}", size).unwrap();
-    }
+            }
+            let grouped = name_prehash
+                .into_iter()
+                .flat_map(|(_basename, nodes)| nodes.into_iter())
+                .map(Ok::<_, IoError>);
+            stream::iter(grouped)
+                // Make sure we move just the size → it's own map (there's likely a better trick
+                // for that)
+                .map(|node| {
+                    let size = node.size;
+                    let path = tree.path(node);
+                    let node = node.clone();
+                    let done = done.fetch_add(1, Ordering::Relaxed);
+                    debug!("[{}/{}] Coputing details of {} of size {}", done, total, path.to_string_lossy(), size);
+                    pool.spawn(future::lazy(move || {
+                        let details = Details::compute(path, node.size);
+                        Ok((node, details)) as IoResult<_>
+                    }))
+                })
+                .buffer_unordered(cpus)
+                .filter_map(|(node, details)| match details {
+                    Ok(details) => Some((node, details)),
+                    Err(e) => {
+                        error!("Error getting file info: {}", e);
+                        None
+                    },
+                })
+                .fold(Box::new(HashMap::new()), |mut hash, (node, details)| {
+                    hash.entry(details)
+                        .or_insert_with(Vec::new)
+                        .push(node);
+                    Ok(hash) as IoResult<_>
+                })
+                .and_then(|hash| {
+                     let s = stream::iter(hash.into_iter().map(|val| Ok(val)))
+                        .filter(|&(_, ref nodes)| nodes.len() > 1)
+                        .map(|(details, nodes): (Details, Vec<_>)| {
+                            let paths = nodes
+                                .iter()
+                                .map(|node| tree.path(&node))
+                                .collect::<Vec<_>>();
+                            let run = move || {
+                                let mut command = Command::new("btrfs-extent-same");
+                                command.arg(format!("{}", details.len));
+                                for path in &paths {
+                                    command.arg(path).arg("0");
+                                }
+                                debug!("cmd: {:?}", command);
+                                match command.status() {
+                                    Ok(status) => if !status.success() {
+                                        error!("Failed to run: {}", status);
+                                    },
+                                    Err(e) => error!("Failed to run: {}", e),
+                                }
+                                Ok(())
+                            };
+                            pool.spawn(future::lazy(run))
+                        });
+                     Ok(s)
+                })
+                .flatten_stream()
+        })
+        .flatten()
+        .buffer_unordered(cpus)
+        .for_each(|_| Ok(()))
+        .wait()
+        .unwrap();
     fs::remove_file(TREE_FILE).unwrap();
     fs::remove_file(DONE_FILE).unwrap();
 }
